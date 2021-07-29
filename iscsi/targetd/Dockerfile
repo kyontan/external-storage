@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM centos:7
-LABEL authors="Raffaele Spazzoli <rspazzol@redhat.com>" 
+FROM scratch
+LABEL authors="Raffaele Spazzoli <rspazzol@redhat.com>, kyontan <kyontan@monora.me>"
 ADD targetd /iscsi-controller
 ENTRYPOINT ["/iscsi-controller"]

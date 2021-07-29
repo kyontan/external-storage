@@ -58,7 +58,7 @@ spec:
       containers:
         - name: iscsi-provisioner
           imagePullPolicy: Always
-          image: quay.io/external_storage/iscsi-controller:latest
+          image: docker.io/kyontan/external-storage-iscsi-controller:latest
           args:
             - "start"
           env:
