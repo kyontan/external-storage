@@ -17,20 +17,21 @@ limitations under the License.
 package provisioner
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sort"
 	"strconv"
 	"strings"
 
-	"github.com/kubernetes-sigs/sig-storage-lib-external-provisioner/controller"
-	"github.com/kubernetes-sigs/sig-storage-lib-external-provisioner/util"
 	"github.com/magiconair/properties"
 	"github.com/powerman/rpc-codec/jsonrpc2"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/sig-storage-lib-external-provisioner/v7/controller"
+	"sigs.k8s.io/sig-storage-lib-external-provisioner/v7/util"
 )
 
 var log = logrus.New()
@@ -109,26 +110,26 @@ func (p *iscsiProvisioner) getAccessModes() []v1.PersistentVolumeAccessMode {
 }
 
 // Provision creates a storage asset and returns a PV object representing it.
-func (p *iscsiProvisioner) Provision(options controller.VolumeOptions) (*v1.PersistentVolume, error) {
+func (p *iscsiProvisioner) Provision(ctx context.Context, options controller.ProvisionOptions) (*v1.PersistentVolume, controller.ProvisioningState, error) {
 	if !util.AccessModesContainedInAll(p.getAccessModes(), options.PVC.Spec.AccessModes) {
-		return nil, fmt.Errorf("invalid AccessModes %v: only AccessModes %v are supported", options.PVC.Spec.AccessModes, p.getAccessModes())
+		return nil, controller.ProvisioningFinished, fmt.Errorf("invalid AccessModes %v: only AccessModes %v are supported", options.PVC.Spec.AccessModes, p.getAccessModes())
 	}
 	log.Debugln("new provision request received for pvc: ", options.PVName)
 	vol, lun, pool, err := p.createVolume(options)
 	if err != nil {
 		log.Warnln(err)
-		return nil, err
+		return nil, controller.ProvisioningFinished, err
 	}
 	log.Debugln("volume created with vol and lun: ", vol, lun)
 
 	annotations := make(map[string]string)
 	annotations["volume_name"] = vol
 	annotations["pool"] = pool
-	annotations["initiators"] = options.Parameters["initiators"]
+	annotations["initiators"] = options.StorageClass.Parameters["initiators"]
 
 	var portals []string
-	if len(options.Parameters["portals"]) > 0 {
-		portals = strings.Split(options.Parameters["portals"], ",")
+	if len(options.StorageClass.Parameters["portals"]) > 0 {
+		portals = strings.Split(options.StorageClass.Parameters["portals"], ",")
 	}
 
 	pv := &v1.PersistentVolume{
@@ -138,7 +139,7 @@ func (p *iscsiProvisioner) Provision(options controller.VolumeOptions) (*v1.Pers
 			Annotations: annotations,
 		},
 		Spec: v1.PersistentVolumeSpec{
-			PersistentVolumeReclaimPolicy: options.PersistentVolumeReclaimPolicy,
+			PersistentVolumeReclaimPolicy: *options.StorageClass.ReclaimPolicy,
 			AccessModes:                   options.PVC.Spec.AccessModes,
 			Capacity: v1.ResourceList{
 				v1.ResourceName(v1.ResourceStorage): options.PVC.Spec.Resources.Requests[v1.ResourceName(v1.ResourceStorage)],
@@ -147,21 +148,21 @@ func (p *iscsiProvisioner) Provision(options controller.VolumeOptions) (*v1.Pers
 			VolumeMode: options.PVC.Spec.VolumeMode,
 			PersistentVolumeSource: v1.PersistentVolumeSource{
 				ISCSI: &v1.ISCSIPersistentVolumeSource{
-					TargetPortal:      options.Parameters["targetPortal"],
+					TargetPortal:      options.StorageClass.Parameters["targetPortal"],
 					Portals:           portals,
-					IQN:               options.Parameters["iqn"],
-					ISCSIInterface:    options.Parameters["iscsiInterface"],
+					IQN:               options.StorageClass.Parameters["iqn"],
+					ISCSIInterface:    options.StorageClass.Parameters["iscsiInterface"],
 					Lun:               lun,
-					ReadOnly:          getReadOnly(options.Parameters["readonly"]),
-					FSType:            getFsType(options.Parameters["fsType"]),
-					DiscoveryCHAPAuth: getBool(options.Parameters["chapAuthDiscovery"]),
-					SessionCHAPAuth:   getBool(options.Parameters["chapAuthSession"]),
-					SecretRef:         getSecretRef(getBool(options.Parameters["chapAuthDiscovery"]), getBool(options.Parameters["chapAuthSession"]), &v1.SecretReference{Name: viper.GetString("provisioner-name") + "-chap-secret"}),
+					ReadOnly:          getReadOnly(options.StorageClass.Parameters["readonly"]),
+					FSType:            getFsType(options.StorageClass.Parameters["fsType"]),
+					DiscoveryCHAPAuth: getBool(options.StorageClass.Parameters["chapAuthDiscovery"]),
+					SessionCHAPAuth:   getBool(options.StorageClass.Parameters["chapAuthSession"]),
+					SecretRef:         getSecretRef(getBool(options.StorageClass.Parameters["chapAuthDiscovery"]), getBool(options.StorageClass.Parameters["chapAuthSession"]), &v1.SecretReference{Name: viper.GetString("provisioner-name") + "-chap-secret"}),
 				},
 			},
 		},
 	}
-	return pv, nil
+	return pv, controller.ProvisioningFinished, nil
 }
 
 func getReadOnly(readonly string) bool {
@@ -197,7 +198,7 @@ func getBool(value string) bool {
 
 // Delete removes the storage asset that was created by Provision represented
 // by the given PV.
-func (p *iscsiProvisioner) Delete(volume *v1.PersistentVolume) error {
+func (p *iscsiProvisioner) Delete(ctx context.Context, volume *v1.PersistentVolume) error {
 	//vol from the annotation
 	log.Debugln("volume deletion request received: ", volume.GetName())
 	for _, initiator := range strings.Split(volume.Annotations["initiators"], ",") {
@@ -228,14 +229,14 @@ func initLog() {
 	}
 }
 
-func (p *iscsiProvisioner) createVolume(options controller.VolumeOptions) (vol string, lun int32, pool string, err error) {
+func (p *iscsiProvisioner) createVolume(options controller.ProvisionOptions) (vol string, lun int32, pool string, err error) {
 	size := getSize(options)
 	vol = p.getVolumeName(options)
 	pool = p.getVolumeGroup(options)
 	initiators := p.getInitiators(options)
 	chapCredentials := &chapSessionCredentials{}
 	//read chap session authentication credentials
-	if getBool(options.Parameters["chapAuthSession"]) {
+	if getBool(options.StorageClass.Parameters["chapAuthSession"]) {
 		prop, err2 := properties.LoadFile(viper.GetString("session-chap-credential-file-path"), properties.UTF8)
 		if err2 != nil {
 			log.Warnln(err2)
@@ -275,7 +276,7 @@ func (p *iscsiProvisioner) createVolume(options controller.VolumeOptions) (vol s
 			return "", 0, "", err
 		}
 		log.Debugln("exported volume name, lun, pool, initiator ", vol, lun, pool, initiator)
-		if getBool(options.Parameters["chapAuthSession"]) {
+		if getBool(options.StorageClass.Parameters["chapAuthSession"]) {
 			log.Debugln("setting up chap session auth for initiator, initiator, in_user, out_user: ", initiator, chapCredentials.InUser, chapCredentials.OutUser)
 			err = p.setInitiatorAuth(initiator, chapCredentials.InUser, chapCredentials.InPassword, chapCredentials.OutUser, chapCredentials.OutPassword)
 			if err != nil {
@@ -288,24 +289,24 @@ func (p *iscsiProvisioner) createVolume(options controller.VolumeOptions) (vol s
 	return vol, lun, pool, nil
 }
 
-func getSize(options controller.VolumeOptions) int64 {
+func getSize(options controller.ProvisionOptions) int64 {
 	q := options.PVC.Spec.Resources.Requests[v1.ResourceName(v1.ResourceStorage)]
 	return q.Value()
 }
 
-func (p *iscsiProvisioner) getVolumeName(options controller.VolumeOptions) string {
+func (p *iscsiProvisioner) getVolumeName(options controller.ProvisionOptions) string {
 	return options.PVName
 }
 
-func (p *iscsiProvisioner) getVolumeGroup(options controller.VolumeOptions) string {
-	if options.Parameters["volumeGroup"] == "" {
+func (p *iscsiProvisioner) getVolumeGroup(options controller.ProvisionOptions) string {
+	if options.StorageClass.Parameters["volumeGroup"] == "" {
 		return "vg-targetd"
 	}
-	return options.Parameters["volumeGroup"]
+	return options.StorageClass.Parameters["volumeGroup"]
 }
 
-func (p *iscsiProvisioner) getInitiators(options controller.VolumeOptions) []string {
-	return strings.Split(options.Parameters["initiators"], ",")
+func (p *iscsiProvisioner) getInitiators(options controller.ProvisionOptions) []string {
+	return strings.Split(options.StorageClass.Parameters["initiators"], ",")
 }
 
 // getFirstAvailableLun gets first available Lun.

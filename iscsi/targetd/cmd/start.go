@@ -17,17 +17,17 @@ limitations under the License.
 package cmd
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/kubernetes-incubator/external-storage/iscsi/targetd/provisioner"
-	"github.com/kubernetes-sigs/sig-storage-lib-external-provisioner/controller"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"sigs.k8s.io/sig-storage-lib-external-provisioner/v7/controller"
 )
 
 var log = logrus.New()
@@ -66,13 +66,6 @@ var startcontrollerCmd = &cobra.Command{
 		}
 		log.Debugln("kube client set created")
 
-		// The controller needs to know what the server version is because out-of-tree
-		// provisioners aren't officially supported until 1.5
-		serverVersion, err := kubernetesClientSet.Discovery().ServerVersion()
-		if err != nil {
-			log.Fatalf("Error getting server version: %v", err)
-		}
-
 		url := fmt.Sprintf("%s://%s:%s@%s:%d/targetrpc", viper.GetString("targetd-scheme"), viper.GetString("targetd-username"), viper.GetString("targetd-password"), viper.GetString("targetd-address"), viper.GetInt("targetd-port"))
 
 		log.Debugln("targed URL", url)
@@ -80,7 +73,7 @@ var startcontrollerCmd = &cobra.Command{
 		iscsiProvisioner := provisioner.NewiscsiProvisioner(url)
 		log.Debugln("iscsi provisioner created")
 
-		pc := controller.NewProvisionController(kubernetesClientSet, viper.GetString("provisioner-name"), iscsiProvisioner, serverVersion.GitVersion, controller.Threadiness(1))
+		pc := controller.NewProvisionController(kubernetesClientSet, viper.GetString("provisioner-name"), iscsiProvisioner, controller.Threadiness(1))
 		controller.ResyncPeriod(viper.GetDuration("resync-period"))
 		controller.ExponentialBackOffOnError(viper.GetBool("exponential-backoff-on-error"))
 		controller.FailedProvisionThreshold(viper.GetInt("fail-retry-threshold"))
@@ -89,7 +82,7 @@ var startcontrollerCmd = &cobra.Command{
 		controller.RenewDeadline(viper.GetDuration("renew-deadline"))
 		controller.RetryPeriod(viper.GetDuration("retry-period"))
 		log.Debugln("iscsi controller created, running forever...")
-		pc.Run(wait.NeverStop)
+		pc.Run(context.Background())
 	},
 }
 
